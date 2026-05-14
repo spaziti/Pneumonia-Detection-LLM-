@@ -1,0 +1,17 @@
+# Environment Variables (Secrets)
+.env
+kaggle.json
+
+# Temporary Data
+.tmp/
+data/
+datasets/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Models
+*.pth
+*.pt
