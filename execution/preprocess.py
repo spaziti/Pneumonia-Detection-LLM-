@@ -145,9 +145,56 @@ def get_weighted_sampler(dataset):
     return sampler
 
 
-def get_dataloaders(data_dir=None, batch_size=32, num_workers=2):
+class MultiModalChestXrayDataset(ChestXrayDataset):
+    """
+    Extends ChestXrayDataset to also return tabular EHR features.
+    Returns (image, tabular_tensor, label) triplets.
+    """
+
+    EHR_FIELDS = [
+        'age', 'temperature', 'heart_rate', 'wbc_count',
+        'respiratory_rate', 'cough_duration_days', 'oxygen_saturation'
+    ]
+
+    def __init__(self, root_dir, split="train", transform=None, ehr_path=None):
+        super().__init__(root_dir, split, transform)
+
+        # Load EHR records
+        if ehr_path is None:
+            ehr_path = PROJECT_ROOT / ".tmp" / "data" / "ehr_records.json"
+
+        import json
+        if Path(ehr_path).exists():
+            with open(ehr_path, 'r') as f:
+                self.ehr_records = json.load(f)
+            print(f"  Loaded {len(self.ehr_records)} EHR records from {ehr_path}")
+        else:
+            print(f"  WARNING: EHR file not found at {ehr_path}, using zero vectors")
+            self.ehr_records = {}
+
+    def __getitem__(self, idx):
+        image, label = super().__getitem__(idx)
+
+        # Look up EHR record by filename
+        filename = Path(self.samples[idx]).name
+        record = self.ehr_records.get(filename, {})
+
+        tabular = torch.FloatTensor([
+            record.get(field, 0.0) for field in self.EHR_FIELDS
+        ])
+
+        return image, tabular, label
+
+
+def get_dataloaders(data_dir=None, batch_size=32, num_workers=2, multimodal=False):
     """
     Create train, val, and test DataLoaders.
+
+    Args:
+        data_dir: Path to chest_xray dataset
+        batch_size: Batch size
+        num_workers: Number of dataloader workers
+        multimodal: If True, uses MultiModalChestXrayDataset (returns image+tabular+label)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -157,10 +204,12 @@ def get_dataloaders(data_dir=None, batch_size=32, num_workers=2):
 
     print("Creating DataLoaders...")
 
+    DatasetClass = MultiModalChestXrayDataset if multimodal else ChestXrayDataset
+
     # Create datasets
-    train_dataset = ChestXrayDataset(data_dir, "train", get_transforms("train"))
-    val_dataset = ChestXrayDataset(data_dir, "val", get_transforms("val"))
-    test_dataset = ChestXrayDataset(data_dir, "test", get_transforms("test"))
+    train_dataset = DatasetClass(data_dir, "train", get_transforms("train"))
+    val_dataset = DatasetClass(data_dir, "val", get_transforms("val"))
+    test_dataset = DatasetClass(data_dir, "test", get_transforms("test"))
 
     if len(train_dataset) == 0:
         raise RuntimeError("No training images found! Ensure you have successfully run download_dataset.py first.")

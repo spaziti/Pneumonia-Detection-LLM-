@@ -24,7 +24,6 @@ import json
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -35,7 +34,7 @@ from tqdm import tqdm
 # Add execution directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from preprocess import get_dataloaders, get_class_weights, CLASS_NAMES
+from preprocess import get_dataloaders, get_class_weights
 from model import build_model
 
 # Paths
@@ -45,7 +44,7 @@ RESULTS_DIR = PROJECT_ROOT / ".tmp" / "results"
 LOG_DIR = PROJECT_ROOT / ".tmp" / "logs"
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs, multimodal=False):
     """Train for one epoch."""
     model.train()
     running_loss = 0.0
@@ -55,11 +54,17 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
     pbar = tqdm(loader, desc=f"  Train Epoch {epoch+1}/{total_epochs}",
                 leave=False, ncols=100)
 
-    for batch_idx, (images, labels) in enumerate(pbar):
-        images, labels = images.to(device), labels.to(device)
+    for batch_idx, batch in enumerate(pbar):
+        if multimodal:
+            images, tabular, labels = batch
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
 
         optimizer.zero_grad()
-        outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
 
@@ -85,16 +90,23 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, multimodal=False):
     """Validate the model."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
+    for batch in loader:
+        if multimodal:
+            images, tabular, labels = batch
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+
         loss = criterion(outputs, labels)
 
         running_loss += loss.item()
@@ -107,7 +119,8 @@ def validate(model, loader, criterion, device):
     return val_loss, val_acc
 
 
-def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7, device=None):
+def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
+                device=None, backbone_ckpt=None, multimodal=False):
     """
     Full training loop for a given model type.
 
@@ -118,6 +131,8 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7, devic
         lr: Learning rate
         patience: Early stopping patience
         device: torch device
+        backbone_ckpt: Path to SimCLR pre-trained backbone (optional)
+        multimodal: If True, uses multi-modal (image + EHR) pipeline
 
     Returns:
         history: dict with training metrics
@@ -142,11 +157,12 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7, devic
     # DataLoaders
     num_workers = 0 if os.name == 'nt' else 2  # Windows compatibility
     train_loader, val_loader, test_loader = get_dataloaders(
-        batch_size=batch_size, num_workers=num_workers
+        batch_size=batch_size, num_workers=num_workers, multimodal=multimodal
     )
 
     # Model
-    model = build_model(model_type, num_classes=2, pretrained=True).to(device)
+    model = build_model(model_type, num_classes=2, pretrained=True,
+                         backbone_ckpt=backbone_ckpt, multimodal=multimodal).to(device)
 
     # Loss with class weights
     class_weights = get_class_weights(train_loader.dataset).to(device)
@@ -175,18 +191,20 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7, devic
     patience_counter = 0
     start_time = time.time()
 
-    print(f"\n  Starting training...\n")
+    print("\n  Starting training...\n")
 
     for epoch in range(epochs):
         epoch_start = time.time()
 
         # Train
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, epochs
+            model, train_loader, criterion, optimizer, device, epoch, epochs,
+            multimodal=multimodal
         )
 
         # Validate
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(model, val_loader, criterion, device,
+                                     multimodal=multimodal)
 
         # Step scheduler
         current_lr = optimizer.param_groups[0]['lr']
@@ -209,7 +227,6 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7, devic
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_val_loss = val_loss
             history['best_val_acc'] = best_val_acc
             history['best_epoch'] = epoch + 1
             patience_counter = 0
@@ -260,6 +277,10 @@ def main():
                         help='Learning rate (default: 1e-4)')
     parser.add_argument('--patience', type=int, default=7,
                         help='Early stopping patience (default: 7)')
+    parser.add_argument('--backbone-ckpt', type=str, default=None,
+                        help='Path to SimCLR pre-trained backbone checkpoint')
+    parser.add_argument('--multimodal', action='store_true',
+                        help='Enable multi-modal training with EHR data')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -278,7 +299,9 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             patience=args.patience,
-            device=device
+            device=device,
+            backbone_ckpt=args.backbone_ckpt,
+            multimodal=args.multimodal
         )
         all_histories[model_type] = history
 

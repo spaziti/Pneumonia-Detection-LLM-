@@ -220,7 +220,8 @@ class HATRHybridModel(nn.Module):
     Target accuracy: ~91.4% per the reference paper.
     """
 
-    def __init__(self, num_classes=2, pretrained=True, token_dim=384):
+    def __init__(self, num_classes=2, pretrained=True, token_dim=384,
+                 backbone_ckpt=None):
         super().__init__()
 
         # CNN Backbone: ResNet-18 feature extractor (without FC and avgpool)
@@ -229,6 +230,18 @@ class HATRHybridModel(nn.Module):
         )
         self.cnn_backbone = nn.Sequential(*list(resnet.children())[:-2])
         cnn_out_channels = 512  # ResNet-18 final layer channels
+
+        # Load SimCLR pre-trained backbone weights if provided
+        if backbone_ckpt is not None:
+            ckpt = torch.load(backbone_ckpt, map_location='cpu', weights_only=False)
+            # SimCLR backbone is Sequential(*resnet.children()[:-1]) = [..., avgpool]
+            # Our backbone is Sequential(*resnet.children()[:-2]) = [..., layer4]
+            # Filter out the avgpool key (index '8') if present
+            state = ckpt.get('backbone_state_dict', ckpt)
+            filtered = {k: v for k, v in state.items()
+                        if not k.startswith('8.')}  # skip avgpool
+            self.cnn_backbone.load_state_dict(filtered, strict=False)
+            print(f"  Loaded SimCLR backbone from {backbone_ckpt}")
 
         # Overlapping tokenizer: CNN features → transformer tokens
         self.tokenizer = OverlappingTokenizer(
@@ -290,8 +303,122 @@ class HATRHybridModel(nn.Module):
         """Get CNN feature maps for Grad-CAM visualization."""
         return self.cnn_backbone(x)
 
+    def get_cls_token(self, x):
+        """Get CLS token embedding (for multi-modal fusion)."""
+        features = self.cnn_backbone(x)
+        tokens = self.tokenizer(features)
+        tokens = self.hatr(tokens)
+        cls_repr = self.transformer(tokens)
+        return cls_repr  # (B, 384)
 
-def build_model(model_type="hatr", num_classes=2, pretrained=True):
+
+class TabularEncoder(nn.Module):
+    """
+    Small MLP that encodes tabular EHR data into an embedding vector.
+    Input: raw clinical features (age, temp, WBC, etc.)
+    Output: dense embedding (64-d)
+    """
+
+    def __init__(self, input_dim=7, hidden_dim=128, embed_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
+
+    def forward(self, x):
+        return self.net(x)  # (B, 64)
+
+
+class MultiModalHATR(nn.Module):
+    """
+    Multi-modal fusion model: combines HATR image features with
+    tabular EHR data via a learnable gating mechanism.
+
+    Architecture:
+        Image  -> HATR backbone -> CLS token (384-d)
+        EHR    -> TabularEncoder -> embedding (64-d)
+        Fusion -> Gated concatenation (448-d) -> classifier
+    """
+
+    def __init__(self, num_classes=2, pretrained=True, token_dim=384,
+                 tabular_input_dim=7, tabular_embed_dim=64,
+                 backbone_ckpt=None):
+        super().__init__()
+
+        # Image branch — full HATR model (we reuse its components)
+        self.image_model = HATRHybridModel(
+            num_classes=num_classes, pretrained=pretrained,
+            token_dim=token_dim, backbone_ckpt=backbone_ckpt
+        )
+        # Remove the original classifier — we build a new fused one
+        self.image_model.classifier = nn.Identity()
+
+        # Tabular branch
+        self.tabular_encoder = TabularEncoder(
+            input_dim=tabular_input_dim,
+            hidden_dim=128,
+            embed_dim=tabular_embed_dim
+        )
+
+        # Project tabular embedding to same dim as CLS token for gating
+        self.tab_projector = nn.Linear(tabular_embed_dim, token_dim)
+
+        # Learnable gate: decides how much to weight image vs tabular
+        fused_dim = token_dim + tabular_embed_dim
+        self.gate = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim),
+            nn.Sigmoid()
+        )
+
+        # Fused classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 128),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
+        )
+
+        # Keep reference for Grad-CAM
+        self.cnn_backbone = self.image_model.cnn_backbone
+
+    def forward(self, image, tabular=None):
+        """
+        Args:
+            image:   (B, 3, 224, 224)
+            tabular: (B, 7) or None — if None, uses zero embedding
+        """
+        # Image branch: get CLS token (classifier replaced with Identity)
+        cls_token = self.image_model(image)  # (B, 384)
+
+        # Tabular branch
+        if tabular is not None:
+            tab_embed = self.tabular_encoder(tabular)  # (B, 64)
+        else:
+            tab_embed = torch.zeros(
+                image.size(0), 64, device=image.device
+            )
+
+        # Fuse via gated concatenation
+        fused = torch.cat([cls_token, tab_embed], dim=1)  # (B, 448)
+        gate_weights = self.gate(fused)
+        fused = fused * gate_weights
+
+        # Classify
+        logits = self.classifier(fused)  # (B, 2)
+        return logits
+
+
+def build_model(model_type="hatr", num_classes=2, pretrained=True,
+                backbone_ckpt=None, multimodal=False):
     """
     Factory function to build the specified model type.
 
@@ -299,25 +426,41 @@ def build_model(model_type="hatr", num_classes=2, pretrained=True):
         model_type: One of 'cnn', 'vit', 'hatr'
         num_classes: Number of output classes
         pretrained: Whether to use pretrained weights
+        backbone_ckpt: Path to SimCLR pre-trained backbone (optional)
+        multimodal: If True, builds MultiModalHATR instead of plain HATR
 
     Returns:
         model: PyTorch model
     """
-    model_map = {
-        "cnn": CNNOnlyModel,
-        "vit": ViTOnlyModel,
-        "hatr": HATRHybridModel,
-    }
+    if multimodal and model_type == 'hatr':
+        model = MultiModalHATR(
+            num_classes=num_classes, pretrained=pretrained,
+            backbone_ckpt=backbone_ckpt
+        )
+        label = 'MULTIMODAL-HATR'
+    else:
+        model_map = {
+            "cnn": CNNOnlyModel,
+            "vit": ViTOnlyModel,
+            "hatr": HATRHybridModel,
+        }
 
-    if model_type not in model_map:
-        raise ValueError(f"Unknown model type '{model_type}'. Choose from: {list(model_map.keys())}")
+        if model_type not in model_map:
+            raise ValueError(f"Unknown model type '{model_type}'. Choose from: {list(model_map.keys())}")
 
-    model = model_map[model_type](num_classes=num_classes, pretrained=pretrained)
+        if model_type == 'hatr' and backbone_ckpt:
+            model = HATRHybridModel(
+                num_classes=num_classes, pretrained=pretrained,
+                backbone_ckpt=backbone_ckpt
+            )
+        else:
+            model = model_map[model_type](num_classes=num_classes, pretrained=pretrained)
+        label = model_type.upper()
 
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n  Model: {model_type.upper()}")
+    print(f"\n  Model: {label}")
     print(f"  Total parameters:     {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
 
@@ -333,6 +476,7 @@ if __name__ == "__main__":
     print(f"\n  Device: {device}")
 
     dummy_input = torch.randn(2, 3, 224, 224).to(device)
+    dummy_tabular = torch.randn(2, 7).to(device)
 
     for model_type in ["cnn", "vit", "hatr"]:
         print(f"\n{'─' * 40}")
@@ -342,6 +486,16 @@ if __name__ == "__main__":
         print(f"  Output: {output.shape}")
         assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
         print(f"  ✓ Forward pass successful")
+
+    # Validate MultiModalHATR
+    print(f"\n{'─' * 40}")
+    mm_model = build_model('hatr', num_classes=2, pretrained=False, multimodal=True).to(device)
+    output = mm_model(dummy_input, dummy_tabular)
+    print(f"  Image input:   {dummy_input.shape}")
+    print(f"  Tabular input: {dummy_tabular.shape}")
+    print(f"  Output:        {output.shape}")
+    assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
+    print(f"  ✓ MultiModal forward pass successful")
 
     print(f"\n{'=' * 60}")
     print("All models validated successfully!")

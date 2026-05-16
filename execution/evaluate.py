@@ -54,18 +54,24 @@ COLORS = {
 
 
 @torch.no_grad()
-def get_predictions(model, loader, device):
+def get_predictions(model, loader, device, multimodal=False):
     """Get predictions and probabilities for the entire dataset."""
     model.eval()
     all_labels = []
     all_preds = []
     all_probs = []
 
-    for images, labels in loader:
-        images = images.to(device)
-        outputs = model(images)
-        probs = torch.softmax(outputs, dim=1)
+    for batch in loader:
+        if multimodal:
+            images, tabular, labels = batch
+            images, tabular = images.to(device), tabular.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images = images.to(device)
+            outputs = model(images)
 
+        probs = torch.softmax(outputs, dim=1)
         _, predicted = outputs.max(1)
 
         all_labels.extend(labels.cpu().numpy())
@@ -232,7 +238,7 @@ def plot_model_comparison(all_metrics, save_dir):
     print(f"    Saved: {save_path.name}")
 
 
-def evaluate_model(model_type, device):
+def evaluate_model(model_type, device, multimodal=False):
     """Full evaluation of a single model."""
     checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
     if not checkpoint_path.exists():
@@ -244,7 +250,8 @@ def evaluate_model(model_type, device):
     print(f"{'─' * 50}")
 
     # Load model
-    model = build_model(model_type, num_classes=2, pretrained=False).to(device)
+    model = build_model(model_type, num_classes=2, pretrained=False,
+                         multimodal=multimodal).to(device)
     
     # Dummy forward pass to initialize dynamic parameters (like pos_embed)
     dummy_input = torch.randn(1, 3, 224, 224).to(device)
@@ -256,10 +263,12 @@ def evaluate_model(model_type, device):
 
     # DataLoader
     num_workers = 0 if os.name == 'nt' else 2
-    _, _, test_loader = get_dataloaders(batch_size=32, num_workers=num_workers)
+    _, _, test_loader = get_dataloaders(batch_size=32, num_workers=num_workers,
+                                         multimodal=multimodal)
 
     # Get predictions
-    labels, preds, probs = get_predictions(model, test_loader, device)
+    labels, preds, probs = get_predictions(model, test_loader, device,
+                                            multimodal=multimodal)
 
     # Compute metrics
     metrics = compute_metrics(labels, preds, probs)
@@ -298,6 +307,8 @@ def main():
     parser.add_argument('--model', type=str, default='hatr',
                         choices=['cnn', 'vit', 'hatr', 'all'],
                         help='Model type to evaluate (default: hatr)')
+    parser.add_argument('--multimodal', action='store_true',
+                        help='Evaluate multi-modal model')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -311,7 +322,7 @@ def main():
     all_results = {}
 
     for model_type in models_to_eval:
-        metrics, results = evaluate_model(model_type, device)
+        metrics, results = evaluate_model(model_type, device, multimodal=args.multimodal)
         if metrics is not None:
             all_metrics[model_type] = metrics
             all_results[model_type] = results
