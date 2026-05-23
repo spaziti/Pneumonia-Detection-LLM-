@@ -13,7 +13,6 @@ Usage:
     weights = get_class_weights(train_loader.dataset)
 """
 
-import os
 from pathlib import Path
 from collections import Counter
 
@@ -44,32 +43,42 @@ CLASS_TO_IDX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 class ChestXrayDataset(Dataset):
     """PyTorch Dataset for Chest X-ray Pneumonia classification."""
 
-    def __init__(self, root_dir, split="train", transform=None):
+    def __init__(self, root_dir, split="train", transform=None, samples=None, labels=None):
         """
         Args:
             root_dir: Path to the chest_xray directory
             split: One of 'train', 'val', 'test'
             transform: torchvision transforms to apply
+            samples: optional list of pre-filtered image paths
+            labels: optional list of corresponding labels
         """
-        self.root_dir = Path(root_dir) / split
+        self.root_dir = Path(root_dir)
         self.transform = transform
-        self.samples = []
-        self.labels = []
+        
+        if samples is not None and labels is not None:
+            self.samples = samples
+            self.labels = labels
+            print(f"  Initialized Custom Split ({split}): {len(self.samples)} images "
+                  f"({dict(Counter(self.labels))})")
+        else:
+            self.root_dir = self.root_dir / split
+            self.samples = []
+            self.labels = []
 
-        # Scan directory for images
-        for class_name in CLASS_NAMES:
-            class_dir = self.root_dir / class_name
-            if not class_dir.exists():
-                print(f"Warning: {class_dir} not found")
-                continue
+            # Scan directory for images
+            for class_name in CLASS_NAMES:
+                class_dir = self.root_dir / class_name
+                if not class_dir.exists():
+                    print(f"Warning: {class_dir} not found")
+                    continue
 
-            for img_path in sorted(class_dir.iterdir()):
-                if img_path.suffix.lower() in ['.jpeg', '.jpg', '.png']:
-                    self.samples.append(str(img_path))
-                    self.labels.append(CLASS_TO_IDX[class_name])
+                for img_path in sorted(class_dir.iterdir()):
+                    if img_path.suffix.lower() in ['.jpeg', '.jpg', '.png']:
+                        self.samples.append(str(img_path))
+                        self.labels.append(CLASS_TO_IDX[class_name])
 
-        print(f"  Loaded {split}: {len(self.samples)} images "
-              f"({dict(Counter(self.labels))})")
+            print(f"  Loaded {split}: {len(self.samples)} images "
+                  f"({dict(Counter(self.labels))})")
 
     def __len__(self):
         return len(self.samples)
@@ -91,13 +100,16 @@ def get_transforms(split="train"):
     """Get transforms for each split."""
     if split == "train":
         return transforms.Compose([
-            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
+            transforms.RandomRotation(degrees=15),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
+            ], p=0.1),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            transforms.RandomErasing(p=0.15, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0, inplace=False),
         ])
     else:
         return transforms.Compose([
@@ -156,8 +168,8 @@ class MultiModalChestXrayDataset(ChestXrayDataset):
         'respiratory_rate', 'cough_duration_days', 'oxygen_saturation'
     ]
 
-    def __init__(self, root_dir, split="train", transform=None, ehr_path=None):
-        super().__init__(root_dir, split, transform)
+    def __init__(self, root_dir, split="train", transform=None, ehr_path=None, samples=None, labels=None):
+        super().__init__(root_dir, split, transform, samples, labels)
 
         # Load EHR records
         if ehr_path is None:
@@ -186,7 +198,7 @@ class MultiModalChestXrayDataset(ChestXrayDataset):
         return image, tabular, label
 
 
-def get_dataloaders(data_dir=None, batch_size=32, num_workers=2, multimodal=False):
+def get_dataloaders(data_dir=None, batch_size=32, num_workers=2, multimodal=False, val_split=0.1):
     """
     Create train, val, and test DataLoaders.
 
@@ -195,6 +207,7 @@ def get_dataloaders(data_dir=None, batch_size=32, num_workers=2, multimodal=Fals
         batch_size: Batch size
         num_workers: Number of dataloader workers
         multimodal: If True, uses MultiModalChestXrayDataset (returns image+tabular+label)
+        val_split: Percentage of train folder samples to use as validation data (default: 0.1)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -206,9 +219,44 @@ def get_dataloaders(data_dir=None, batch_size=32, num_workers=2, multimodal=Fals
 
     DatasetClass = MultiModalChestXrayDataset if multimodal else ChestXrayDataset
 
-    # Create datasets
-    train_dataset = DatasetClass(data_dir, "train", get_transforms("train"))
-    val_dataset = DatasetClass(data_dir, "val", get_transforms("val"))
+    if val_split > 0:
+        # Load samples from both train and val directories to form the full training pool
+        train_raw = DatasetClass(data_dir, "train", transform=None)
+        val_raw = DatasetClass(data_dir, "val", transform=None)
+        
+        all_samples = train_raw.samples + val_raw.samples
+        all_labels = train_raw.labels + val_raw.labels
+        
+        # Perform stratified or random split with fixed seed
+        n_samples = len(all_samples)
+        indices = np.arange(n_samples)
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        
+        val_size = int(n_samples * val_split)
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+        
+        train_samples = [all_samples[i] for i in train_indices]
+        train_labels = [all_labels[i] for i in train_indices]
+        
+        val_samples = [all_samples[i] for i in val_indices]
+        val_labels = [all_labels[i] for i in val_indices]
+        
+        # Instantiate train and val datasets with custom samples and transforms
+        train_dataset = DatasetClass(
+            data_dir, "train", get_transforms("train"), 
+            samples=train_samples, labels=train_labels
+        )
+        val_dataset = DatasetClass(
+            data_dir, "val", get_transforms("val"), 
+            samples=val_samples, labels=val_labels
+        )
+    else:
+        # Original behaviour
+        train_dataset = DatasetClass(data_dir, "train", get_transforms("train"))
+        val_dataset = DatasetClass(data_dir, "val", get_transforms("val"))
+        
     test_dataset = DatasetClass(data_dir, "test", get_transforms("test"))
 
     if len(train_dataset) == 0:

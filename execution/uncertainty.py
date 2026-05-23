@@ -49,7 +49,7 @@ def enable_mc_dropout(model):
             module.train()  # Re-enable dropout
 
 
-def mc_predict(model, image_tensor, n_passes=50):
+def mc_predict(model, image_tensor, n_passes=50, tabular=None):
     """
     Run *n_passes* stochastic forward passes and aggregate results.
 
@@ -57,6 +57,7 @@ def mc_predict(model, image_tensor, n_passes=50):
         model: PyTorch model (dropout layers must be in train mode)
         image_tensor: (1, 3, H, W) preprocessed input
         n_passes: number of stochastic forward passes
+        tabular: (1, F) optional tabular tensor for multimodal models
 
     Returns:
         mean_prob:   float — mean predicted probability of the positive class
@@ -67,7 +68,10 @@ def mc_predict(model, image_tensor, n_passes=50):
     all_probs = []
     with torch.no_grad():
         for _ in range(n_passes):
-            output = model(image_tensor)
+            if tabular is not None:
+                output = model(image_tensor, tabular)
+            else:
+                output = model(image_tensor)
             prob = F.softmax(output, dim=1)[:, 1]  # P(Pneumonia)
             all_probs.append(prob.cpu().item())
 
@@ -79,7 +83,7 @@ def mc_predict(model, image_tensor, n_passes=50):
     return mean_prob, std_prob, all_probs, pred_class
 
 
-def classify_with_uncertainty(model, dataloader, device, n_passes=50):
+def classify_with_uncertainty(model, dataloader, device, n_passes=50, multimodal=False):
     """
     Run MC Dropout inference on an entire dataloader.
 
@@ -91,13 +95,20 @@ def classify_with_uncertainty(model, dataloader, device, n_passes=50):
     results = []
 
     pbar = tqdm(dataloader, desc="MC Dropout Inference", ncols=100)
-    for images, labels in pbar:
+    for batch in pbar:
+        if multimodal:
+            images, tabular_data, labels = batch
+        else:
+            images, labels = batch
+            tabular_data = None
+
         for i in range(images.size(0)):
             img = images[i:i+1].to(device)
             label = labels[i].item()
+            tab = tabular_data[i:i+1].to(device) if tabular_data is not None else None
 
             mean_prob, std_prob, _, pred_class = mc_predict(
-                model, img, n_passes=n_passes
+                model, img, n_passes=n_passes, tabular=tab
             )
 
             results.append({
@@ -227,6 +238,8 @@ def main():
                         help='Number of MC Dropout forward passes (default: 50)')
     parser.add_argument('--threshold', type=float, default=0.15,
                         help='Uncertainty threshold for flagging (default: 0.15)')
+    parser.add_argument('--multimodal', action='store_true',
+                        help='Use multi-modal model with EHR data')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,30 +251,30 @@ def main():
     print(f"  Model:       {args.model.upper()}")
     print(f"  MC passes:   {args.n_passes}")
     print(f"  Threshold:   {args.threshold}")
+    print(f"  Multimodal:  {args.multimodal}")
 
-    # Load model
+    # Load model (pos_embed is now initialized in __init__, no dummy forward needed)
     checkpoint_path = CHECKPOINT_DIR / f"best_{args.model}.pth"
     if not checkpoint_path.exists():
         print(f"\n  ERROR: No checkpoint found at {checkpoint_path}")
         sys.exit(1)
 
-    model = build_model(args.model, num_classes=2, pretrained=False).to(device)
-
-    # Dummy forward to init dynamic params (pos_embed)
-    dummy = torch.randn(1, 3, 224, 224).to(device)
-    model(dummy)
-
+    model = build_model(args.model, num_classes=2, pretrained=False,
+                        multimodal=args.multimodal).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"  Loaded checkpoint from epoch {checkpoint['epoch']}")
 
     # DataLoader
     num_workers = 0 if os.name == 'nt' else 2
-    _, _, test_loader = get_dataloaders(batch_size=32, num_workers=num_workers)
+    _, _, test_loader = get_dataloaders(batch_size=32, num_workers=num_workers,
+                                        multimodal=args.multimodal)
 
     # Run MC Dropout
     print(f"\n  Running {args.n_passes} stochastic passes per sample...\n")
-    results = classify_with_uncertainty(model, test_loader, device, n_passes=args.n_passes)
+    results = classify_with_uncertainty(model, test_loader, device,
+                                        n_passes=args.n_passes,
+                                        multimodal=args.multimodal)
 
     # ------- Summary statistics -------
     total = len(results)
@@ -273,9 +286,9 @@ def main():
     correct_unc = np.mean([r['uncertainty'] for r in results if r['correct']])
     wrong_unc = np.mean([r['uncertainty'] for r in results if not r['correct']]) if any(not r['correct'] for r in results) else 0.0
 
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     print("  RESULTS SUMMARY")
-    print(f"{'─' * 50}")
+    print(f"{'-' * 50}")
     print(f"  Total samples:          {total}")
     print(f"  MC Dropout Accuracy:    {accuracy:.2f}%")
     print(f"  Mean uncertainty:       {mean_unc:.4f}")

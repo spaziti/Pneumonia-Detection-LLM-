@@ -14,7 +14,6 @@ Usage:
     uvicorn server:app --reload --port 8000
 """
 
-import os
 import io
 import sys
 import json
@@ -41,7 +40,7 @@ sys.path.insert(0, str(EXECUTION_DIR))
 
 from preprocess import IMG_SIZE, IMAGENET_MEAN, IMAGENET_STD, CLASS_NAMES
 from model import build_model
-from gradcam import GradCAM, get_target_layer, load_and_preprocess_image
+from gradcam import GradCAM, get_target_layer
 from uncertainty import enable_mc_dropout, mc_predict
 from llm_report import (
     extract_spatial_features,
@@ -60,15 +59,22 @@ CHECKPOINT_DIR = PROJECT_ROOT / ".tmp" / "checkpoints"
 _model = None
 _device = None
 _model_type = "hatr"
+_is_multimodal = False
 
 # Store the last gradcam heatmap + raw image for threshold re-rendering
 _last_heatmap = None
 _last_raw_img = None
 
+# EHR field order matching TabularEncoder / ehr_simulator
+_EHR_FIELDS = [
+    'age', 'temperature', 'heart_rate', 'wbc_count',
+    'respiratory_rate', 'cough_duration_days', 'oxygen_saturation'
+]
+
 
 def _load_model():
-    """Load the HATR model from best checkpoint."""
-    global _model, _device, _model_type
+    """Load the HATR model from best checkpoint, auto-detecting multimodal."""
+    global _model, _device, _model_type, _is_multimodal
 
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_path = CHECKPOINT_DIR / f"best_{_model_type}.pth"
@@ -77,17 +83,20 @@ def _load_model():
         print(f"[server] WARNING: No checkpoint at {checkpoint_path}")
         return False
 
-    _model = build_model(_model_type, num_classes=2, pretrained=False).to(_device)
-
-    # Dummy forward to init dynamic params (e.g. pos_embed)
-    dummy = torch.randn(1, 3, 224, 224).to(_device)
-    _model(dummy)
-
+    # Peek at checkpoint keys to detect multimodal weights
     ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=False)
+    state_keys = ckpt.get("model_state_dict", {}).keys()
+    _is_multimodal = any(k.startswith("tabular_encoder") for k in state_keys)
+
+    _model = build_model(
+        _model_type, num_classes=2, pretrained=False,
+        multimodal=_is_multimodal
+    ).to(_device)
     _model.load_state_dict(ckpt["model_state_dict"])
     _model.eval()
 
-    print(f"[server] Model loaded from epoch {ckpt['epoch']} "
+    mode_label = "MULTIMODAL" if _is_multimodal else "STANDARD"
+    print(f"[server] Model loaded ({mode_label}) from epoch {ckpt['epoch']} "
           f"(val_acc={ckpt.get('val_acc', '?'):.2f}%)")
     return True
 
@@ -116,7 +125,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -126,6 +135,21 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _safe_float(val):
+    """Safely convert a value to float, defaulting to 0.0 on None, empty string, or error."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        val_str = str(val).strip()
+        if not val_str:
+            return 0.0
+        return float(val_str)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _pil_to_tensor(pil_img: Image.Image):
     """Convert PIL image to preprocessed model input tensor."""
     from torchvision import transforms
@@ -196,22 +220,73 @@ async def predict(
     try:
         # --- Read image ---
         img_bytes = await file.read()
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        
+        # Check if DICOM file
+        is_dicom = False
+        if file.filename and file.filename.lower().endswith(".dcm"):
+            is_dicom = True
+
+        if is_dicom:
+            try:
+                import pydicom
+            except ImportError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Uploaded a DICOM (.dcm) file, but 'pydicom' is not installed. Please run 'pip install pydicom' on the server."}
+                )
+            try:
+                ds = pydicom.dcmread(io.BytesIO(img_bytes))
+                pixel_array = ds.pixel_array
+                p_min, p_max = pixel_array.min(), pixel_array.max()
+                if p_max == p_min:
+                    pixel_array = np.zeros_like(pixel_array)
+                else:
+                    pixel_array = ((pixel_array - p_min) / (p_max - p_min) * 255.0).astype(np.uint8)
+                pil_img = Image.fromarray(pixel_array).convert("RGB")
+            except Exception as dcm_err:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Failed to parse DICOM image: {str(dcm_err)}"}
+                )
+        else:
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
         raw_img_np = np.array(pil_img.resize((IMG_SIZE, IMG_SIZE)))
         tensor = _pil_to_tensor(pil_img).to(_device)
+
+        # --- Parse EHR early (needed for multimodal prediction) ---
+        ehr_data = None
+        if ehr_json and ehr_json.strip():
+            try:
+                ehr_data = json.loads(ehr_json)
+            except json.JSONDecodeError:
+                pass
+
+        # Build tabular tensor for multimodal models
+        tabular_tensor = None
+        if _is_multimodal:
+            import torch as _torch
+            if ehr_data:
+                tab_vals = [_safe_float(ehr_data.get(f, 0.0)) for f in _EHR_FIELDS]
+            else:
+                tab_vals = [0.0] * len(_EHR_FIELDS)
+            tabular_tensor = _torch.FloatTensor([tab_vals]).to(_device)
 
         # --- 1. Prediction ---
         _model.eval()
         with torch.no_grad():
-            output = _model(tensor)
+            if _is_multimodal:
+                output = _model(tensor, tabular_tensor)
+            else:
+                output = _model(tensor)
             probs = TF.softmax(output, dim=1)
             pred_idx = output.argmax(dim=1).item()
             confidence = probs[0, pred_idx].item()
 
-        # --- 2. Grad-CAM ---
+        # --- 2. Grad-CAM (context manager auto-cleans hooks) ---
         target_layer = get_target_layer(_model, _model_type)
-        grad_cam = GradCAM(_model, target_layer)
-        heatmap, _, _ = grad_cam.generate(tensor, target_class=pred_idx)
+        with GradCAM(_model, target_layer) as grad_cam:
+            heatmap, _, _ = grad_cam.generate(tensor, target_class=pred_idx, tabular=tabular_tensor)
         spatial_info = extract_spatial_features(heatmap)
 
         _last_heatmap = heatmap
@@ -225,18 +300,10 @@ async def predict(
         # --- 3. Uncertainty ---
         enable_mc_dropout(_model)
         mean_prob, uncertainty, all_probs, mc_pred = mc_predict(
-            _model, tensor, n_passes=n_passes
+            _model, tensor, n_passes=n_passes, tabular=tabular_tensor
         )
 
-        # --- 4. EHR data ---
-        ehr_data = None
-        if ehr_json and ehr_json.strip():
-            try:
-                ehr_data = json.loads(ehr_json)
-            except json.JSONDecodeError:
-                pass
-
-        # --- 5. Report ---
+        # --- 4. Report ---
         prompt = build_radiology_prompt(
             pred_idx, confidence, uncertainty, spatial_info, ehr_data
         )
@@ -246,7 +313,7 @@ async def predict(
                 pred_idx, confidence, uncertainty, spatial_info, ehr_data
             )
 
-        # --- 6. Persist ---
+        # --- 5. Persist ---
         record = {
             "timestamp": datetime.now().isoformat(),
             "image_name": file.filename or "upload.jpeg",

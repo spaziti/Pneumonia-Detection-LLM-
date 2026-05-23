@@ -18,7 +18,6 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib
@@ -290,8 +289,8 @@ def generate_full_report(model, model_type, image_path, device,
 
     # --- 2. Grad-CAM spatial analysis ---
     target_layer = get_target_layer(model, model_type)
-    grad_cam = GradCAM(model, target_layer)
-    heatmap, _, _ = grad_cam.generate(tensor, target_class=prediction)
+    with GradCAM(model, target_layer) as grad_cam:
+        heatmap, _, _ = grad_cam.generate(tensor, target_class=prediction)
     spatial_info = extract_spatial_features(heatmap)
     print(f"    Primary region: {spatial_info['primary_region']}")
 
@@ -358,12 +357,8 @@ def main():
         print(f"\n  ERROR: No checkpoint at {checkpoint_path}")
         sys.exit(1)
 
+    # Load model (pos_embed is now initialized in __init__, no dummy forward needed)
     model = build_model(args.model, num_classes=2, pretrained=False).to(device)
-
-    # Dummy forward to init dynamic params
-    dummy = torch.randn(1, 3, 224, 224).to(device)
-    model(dummy)
-
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 

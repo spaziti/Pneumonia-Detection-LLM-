@@ -22,13 +22,15 @@ import os
 import sys
 import json
 import time
+import math
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 # Add execution directory to path
@@ -44,7 +46,7 @@ RESULTS_DIR = PROJECT_ROOT / ".tmp" / "results"
 LOG_DIR = PROJECT_ROOT / ".tmp" / "logs"
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs, multimodal=False):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs, multimodal=False, mixup_alpha=0.2):
     """Train for one epoch."""
     model.train()
     running_loss = 0.0
@@ -55,17 +57,49 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
                 leave=False, ncols=100)
 
     for batch_idx, batch in enumerate(pbar):
+        if os.environ.get("DRY_RUN") == "1" and batch_idx >= 5:
+            break
         if multimodal:
             images, tabular, labels = batch
             images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
-            outputs = model(images, tabular)
+            
+            # Apply MixUp if active
+            if mixup_alpha > 0 and model.training and images.size(0) > 1:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                index = torch.randperm(images.size(0)).to(device)
+                
+                mixed_images = lam * images + (1 - lam) * images[index]
+                mixed_tabular = lam * tabular + (1 - lam) * tabular[index]
+                labels_a, labels_b = labels, labels[index]
+                
+                outputs = model(mixed_images, mixed_tabular)
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                outputs = model(images, tabular)
+                loss = criterion(outputs, labels)
+                lam = 1.0
+                labels_a = labels
         else:
             images, labels = batch
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            
+            # Apply MixUp if active
+            if mixup_alpha > 0 and model.training and images.size(0) > 1:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                index = torch.randperm(images.size(0)).to(device)
+                
+                mixed_images = lam * images + (1 - lam) * images[index]
+                labels_a, labels_b = labels, labels[index]
+                
+                outputs = model(mixed_images)
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                lam = 1.0
+                labels_a = labels
 
         optimizer.zero_grad()
-        loss = criterion(outputs, labels)
         loss.backward()
 
         # Gradient clipping for stability
@@ -76,7 +110,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
         running_loss += loss.item()
         _, predicted = outputs.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        
+        if mixup_alpha > 0 and model.training and images.size(0) > 1:
+            target_labels = labels_a if lam >= 0.5 else labels_b
+            correct += predicted.eq(target_labels).sum().item()
+        else:
+            correct += predicted.eq(labels).sum().item()
 
         # Update progress bar
         pbar.set_postfix({
@@ -97,7 +136,9 @@ def validate(model, loader, criterion, device, multimodal=False):
     correct = 0
     total = 0
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
+        if os.environ.get("DRY_RUN") == "1" and batch_idx >= 2:
+            break
         if multimodal:
             images, tabular, labels = batch
             images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
@@ -117,10 +158,48 @@ def validate(model, loader, criterion, device, multimodal=False):
     val_loss = running_loss / len(loader)
     val_acc = 100. * correct / total
     return val_loss, val_acc
+def get_parameter_groups(model, model_type, lr, weight_decay=0.05, multimodal=False):
+    """
+    Split model parameters into backbone and other parameters.
+    Returns list of dicts for optimizer.
+    """
+    backbone_params = []
+    other_params = []
+
+    # Identify backbone parameters
+    if model_type == 'hatr':
+        if multimodal:
+            backbone_params = list(model.image_model.cnn_backbone.parameters())
+            backbone_ids = set(map(id, backbone_params))
+            other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+        else:
+            backbone_params = list(model.cnn_backbone.parameters())
+            backbone_ids = set(map(id, backbone_params))
+            other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+    elif model_type == 'cnn':
+        backbone_params = [p for name, p in model.backbone.named_parameters() if not name.startswith('fc')]
+        backbone_ids = set(map(id, backbone_params))
+        other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+    else:
+        other_params = list(model.parameters())
+
+    if len(backbone_params) > 0:
+        param_groups = [
+            # Group 0: backbone. Initial lr is 0.1 * lr (10x lower)
+            {'params': backbone_params, 'lr': lr * 0.1, 'weight_decay': weight_decay, 'name': 'backbone'},
+            # Group 1: head/transformer
+            {'params': other_params, 'lr': lr, 'weight_decay': weight_decay, 'name': 'head'}
+        ]
+    else:
+        param_groups = [
+            {'params': other_params, 'lr': lr, 'weight_decay': weight_decay, 'name': 'all'}
+        ]
+        
+    return param_groups
 
 
 def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
-                device=None, backbone_ckpt=None, multimodal=False):
+                device=None, backbone_ckpt=None, multimodal=False, backbone_type="resnet18"):
     """
     Full training loop for a given model type.
 
@@ -133,6 +212,7 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
         device: torch device
         backbone_ckpt: Path to SimCLR pre-trained backbone (optional)
         multimodal: If True, uses multi-modal (image + EHR) pipeline
+        backbone_type: CNN backbone type ('resnet18' or 'resnet50')
 
     Returns:
         history: dict with training metrics
@@ -149,6 +229,7 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
     print(f"TRAINING: {model_type.upper()} Model")
     print(f"{'=' * 60}")
     print(f"  Device:     {device}")
+    print(f"  Backbone:   {backbone_type}")
     print(f"  Epochs:     {epochs}")
     print(f"  Batch size: {batch_size}")
     print(f"  LR:         {lr}")
@@ -162,17 +243,29 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
 
     # Model
     model = build_model(model_type, num_classes=2, pretrained=True,
-                         backbone_ckpt=backbone_ckpt, multimodal=multimodal).to(device)
+                         backbone_ckpt=backbone_ckpt, multimodal=multimodal,
+                         backbone_type=backbone_type).to(device)
 
-    # Loss with class weights
+    # Loss with class weights and label smoothing
     class_weights = get_class_weights(train_loader.dataset).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
-    # Optimizer: Adam as specified in report
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-3)
+    # Param groups and Optimizer: AdamW with weight decay
+    param_groups = get_parameter_groups(model, model_type, lr, weight_decay=0.05, multimodal=multimodal)
+    optimizer = optim.AdamW(param_groups)
 
-    # Scheduler: Cosine annealing
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
+    # Scheduler: Warmup (5 epochs) + Cosine Annealing using LambdaLR
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return 0.01 + 0.99 * (epoch / warmup_epochs)
+        else:
+            denom = max(1, epochs - 1 - warmup_epochs)
+            progress = (epoch - warmup_epochs) / denom
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return 0.01 + 0.99 * cosine_decay
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     # Training history
     history = {
@@ -196,10 +289,30 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
     for epoch in range(epochs):
         epoch_start = time.time()
 
+        # Progressive unfreezing logic
+        if model_type in ['cnn', 'hatr']:
+            if epoch < 3:
+                # Ensure backbone is frozen
+                for param_group in optimizer.param_groups:
+                    if param_group.get('name') == 'backbone':
+                        for p in param_group['params']:
+                            p.requires_grad = False
+            else:
+                # Unfreeze backbone
+                unfrozen_count = 0
+                for param_group in optimizer.param_groups:
+                    if param_group.get('name') == 'backbone':
+                        for p in param_group['params']:
+                            if not p.requires_grad:
+                                p.requires_grad = True
+                                unfrozen_count += 1
+                if unfrozen_count > 0:
+                    print(f"  [Epoch {epoch+1}] Unfroze backbone ({unfrozen_count} parameters) with 10x lower learning rate.")
+
         # Train
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch, epochs,
-            multimodal=multimodal
+            multimodal=multimodal, mixup_alpha=0.2
         )
 
         # Validate
@@ -207,7 +320,7 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
                                      multimodal=multimodal)
 
         # Step scheduler
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[-1]['lr']
         scheduler.step()
 
         # Record history
@@ -231,7 +344,7 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
             history['best_epoch'] = epoch + 1
             patience_counter = 0
 
-            checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+            checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}_{backbone_type}.pth"
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -239,13 +352,27 @@ def train_model(model_type, epochs=25, batch_size=32, lr=1e-4, patience=7,
                 'val_acc': val_acc,
                 'val_loss': val_loss,
                 'model_type': model_type,
+                'backbone_type': backbone_type,
             }, checkpoint_path)
+            
+            # Also save to default file path for compatibility
+            default_checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+                'model_type': model_type,
+                'backbone_type': backbone_type,
+            }, default_checkpoint_path)
             print(f"  * Best model saved (val_acc: {val_acc:.2f}%)")
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"\n  Early stopping triggered after {patience} epochs without improvement.")
                 break
+
 
     total_time = time.time() - start_time
     history['total_time'] = total_time
@@ -269,6 +396,9 @@ def main():
     parser.add_argument('--model', type=str, default='hatr',
                         choices=['cnn', 'vit', 'hatr', 'all'],
                         help='Model type to train (default: hatr)')
+    parser.add_argument('--backbone', type=str, default='resnet18',
+                        choices=['resnet18', 'resnet50'],
+                        help='CNN backbone type (default: resnet18)')
     parser.add_argument('--epochs', type=int, default=25,
                         help='Number of training epochs (default: 25)')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -301,7 +431,8 @@ def main():
             patience=args.patience,
             device=device,
             backbone_ckpt=args.backbone_ckpt,
-            multimodal=args.multimodal
+            multimodal=args.multimodal,
+            backbone_type=args.backbone
         )
         all_histories[model_type] = history
 

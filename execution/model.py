@@ -27,16 +27,22 @@ import math
 
 class CNNOnlyModel(nn.Module):
     """
-    Baseline CNN model using ResNet-18.
-    Expected accuracy: ~87.3% per the reference paper.
+    Baseline CNN model using ResNet-18 or ResNet-50.
     """
 
-    def __init__(self, num_classes=2, pretrained=True):
+    def __init__(self, num_classes=2, pretrained=True, backbone_type="resnet18"):
         super().__init__()
-        # Load pretrained ResNet-18
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        self.backbone = models.resnet18(weights=weights)
-        in_features = self.backbone.fc.in_features  # 512
+        # Load pretrained backbone
+        if backbone_type == "resnet18":
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            self.backbone = models.resnet18(weights=weights)
+        elif backbone_type == "resnet50":
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            self.backbone = models.resnet50(weights=weights)
+        else:
+            raise ValueError(f"Unknown backbone_type: {backbone_type}")
+
+        in_features = self.backbone.fc.in_features
 
         # Replace classification head
         self.backbone.fc = nn.Sequential(
@@ -169,6 +175,9 @@ class HierarchicalTokenRefinement(nn.Module):
 class TransformerEncoder(nn.Module):
     """Lightweight transformer encoder for token processing."""
 
+    # Default sequence length: 49 tokens (7x7 from ResNet-18) + 1 CLS = 50
+    DEFAULT_SEQ_LEN = 50
+
     def __init__(self, token_dim, num_layers=4, num_heads=4, mlp_ratio=2.0, dropout=0.1):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
@@ -182,7 +191,36 @@ class TransformerEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.randn(1, 1, token_dim) * 0.02)
-        self.pos_embed = None  # Will be initialized in forward
+        # Positional embedding is now a proper parameter visible to the optimizer
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.DEFAULT_SEQ_LEN, token_dim) * 0.02
+        )
+
+    def _interpolate_pos_embed(self, seq_len):
+        """Interpolate positional embeddings when sequence length differs from default."""
+        if seq_len == self.pos_embed.shape[1]:
+            return self.pos_embed
+
+        # Separate CLS pos embed from spatial pos embeds
+        cls_pos = self.pos_embed[:, :1, :]        # (1, 1, D)
+        spatial_pos = self.pos_embed[:, 1:, :]    # (1, default_N, D)
+
+        target_N = seq_len - 1  # exclude CLS
+        source_N = spatial_pos.shape[1]
+
+        # Reshape to 2D grid, interpolate, reshape back
+        D = spatial_pos.shape[2]
+        src_side = int(math.sqrt(source_N))
+        tgt_side = int(math.sqrt(target_N))
+
+        spatial_pos = spatial_pos.reshape(1, src_side, src_side, D).permute(0, 3, 1, 2)
+        spatial_pos = F.interpolate(
+            spatial_pos, size=(tgt_side, tgt_side),
+            mode='bicubic', align_corners=False
+        )
+        spatial_pos = spatial_pos.permute(0, 2, 3, 1).reshape(1, target_N, D)
+
+        return torch.cat([cls_pos, spatial_pos], dim=1)
 
     def forward(self, tokens):
         B, N, D = tokens.shape
@@ -191,12 +229,9 @@ class TransformerEncoder(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         tokens = torch.cat([cls_tokens, tokens], dim=1)  # (B, N+1, D)
 
-        # Add positional embedding
-        if self.pos_embed is None or self.pos_embed.shape[1] != N + 1:
-            self.pos_embed = nn.Parameter(
-                torch.randn(1, N + 1, D, device=tokens.device) * 0.02
-            )
-        tokens = tokens + self.pos_embed
+        # Add positional embedding (with interpolation for non-default sizes)
+        pos = self._interpolate_pos_embed(N + 1)
+        tokens = tokens + pos
 
         # Encode
         tokens = self.encoder(tokens)
@@ -221,15 +256,24 @@ class HATRHybridModel(nn.Module):
     """
 
     def __init__(self, num_classes=2, pretrained=True, token_dim=384,
-                 backbone_ckpt=None):
+                 backbone_ckpt=None, backbone_type="resnet18"):
         super().__init__()
 
-        # CNN Backbone: ResNet-18 feature extractor (without FC and avgpool)
-        resnet = models.resnet18(
-            weights=models.ResNet18_Weights.DEFAULT if pretrained else None
-        )
+        # CNN Backbone feature extractor (without FC and avgpool)
+        if backbone_type == "resnet18":
+            resnet = models.resnet18(
+                weights=models.ResNet18_Weights.DEFAULT if pretrained else None
+            )
+            cnn_out_channels = 512
+        elif backbone_type == "resnet50":
+            resnet = models.resnet50(
+                weights=models.ResNet50_Weights.DEFAULT if pretrained else None
+            )
+            cnn_out_channels = 2048
+        else:
+            raise ValueError(f"Unknown backbone_type: {backbone_type}")
+
         self.cnn_backbone = nn.Sequential(*list(resnet.children())[:-2])
-        cnn_out_channels = 512  # ResNet-18 final layer channels
 
         # Load SimCLR pre-trained backbone weights if provided
         if backbone_ckpt is not None:
@@ -336,26 +380,77 @@ class TabularEncoder(nn.Module):
         return self.net(x)  # (B, 64)
 
 
+class CBAMMultimodalFusion(nn.Module):
+    """
+    Multimodal CBAM module where tabular clinical features modulate 
+    both channel and spatial attention maps of the CNN backbone.
+    """
+    def __init__(self, cnn_channels, tab_dim, reduction_ratio=16):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+        
+        # Shared MLP for Channel Attention (incorporating tabular features)
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(cnn_channels + tab_dim, cnn_channels // reduction_ratio),
+            nn.ReLU(inplace=True),
+            nn.Linear(cnn_channels // reduction_ratio, cnn_channels)
+        )
+        
+        # Spatial Attention
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, features, tab_embed):
+        B, C, H, W = features.shape
+        
+        # Channel Attention: Average and Max Pooling
+        avg_pool = torch.mean(features, dim=(2, 3))  # (B, C)
+        max_pool = torch.max(features.view(B, C, -1), dim=2)[0]  # (B, C)
+        
+        # Fuse with Tabular Features
+        avg_fused = torch.cat([avg_pool, tab_embed], dim=1)  # (B, C + D_tab)
+        max_fused = torch.cat([max_pool, tab_embed], dim=1)  # (B, C + D_tab)
+        
+        # Channel attention weights
+        channel_att = self.shared_mlp(avg_fused) + self.shared_mlp(max_fused)  # (B, C)
+        channel_scale = self.sigmoid(channel_att).view(B, C, 1, 1)
+        
+        features_scaled = features * channel_scale
+        
+        # Spatial Attention
+        avg_out = torch.mean(features_scaled, dim=1, keepdim=True)  # (B, 1, H, W)
+        max_out, _ = torch.max(features_scaled, dim=1, keepdim=True)  # (B, 1, H, W)
+        spatial_fused = torch.cat([avg_out, max_out], dim=1)  # (B, 2, H, W)
+        
+        spatial_scale = self.sigmoid(self.spatial_conv(spatial_fused))  # (B, 1, H, W)
+        
+        return features_scaled * spatial_scale
+
+
 class MultiModalHATR(nn.Module):
     """
     Multi-modal fusion model: combines HATR image features with
-    tabular EHR data via a learnable gating mechanism.
+    tabular EHR data via early CBAM-based attention-fusion.
 
     Architecture:
-        Image  -> HATR backbone -> CLS token (384-d)
-        EHR    -> TabularEncoder -> embedding (64-d)
-        Fusion -> Gated concatenation (448-d) -> classifier
+        Image  -> CNN features (B, C, H, W)
+        EHR    -> TabularEncoder -> embedding (B, 64)
+        Fusion -> CBAMMultimodalFusion -> refined CNN features (B, C, H, W)
+        Tokens -> OverlappingTokenizer -> tokens (B, 49, 384)
+        Encoder-> TransformerEncoder -> CLS token representation (B, 384)
+        Head   -> Classifier -> logits (B, 2)
     """
 
     def __init__(self, num_classes=2, pretrained=True, token_dim=384,
                  tabular_input_dim=7, tabular_embed_dim=64,
-                 backbone_ckpt=None):
+                 backbone_ckpt=None, backbone_type="resnet18"):
         super().__init__()
 
         # Image branch — full HATR model (we reuse its components)
         self.image_model = HATRHybridModel(
             num_classes=num_classes, pretrained=pretrained,
-            token_dim=token_dim, backbone_ckpt=backbone_ckpt
+            token_dim=token_dim, backbone_ckpt=backbone_ckpt,
+            backbone_type=backbone_type
         )
         # Remove the original classifier — we build a new fused one
         self.image_model.classifier = nn.Identity()
@@ -367,21 +462,25 @@ class MultiModalHATR(nn.Module):
             embed_dim=tabular_embed_dim
         )
 
-        # Project tabular embedding to same dim as CLS token for gating
-        self.tab_projector = nn.Linear(tabular_embed_dim, token_dim)
+        # CNN output channels
+        if backbone_type == "resnet18":
+            cnn_out_channels = 512
+        elif backbone_type == "resnet50":
+            cnn_out_channels = 2048
+        else:
+            raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
-        # Learnable gate: decides how much to weight image vs tabular
-        fused_dim = token_dim + tabular_embed_dim
-        self.gate = nn.Sequential(
-            nn.Linear(fused_dim, fused_dim),
-            nn.Sigmoid()
+        # CBAM Multimodal Fusion
+        self.cbam_fusion = CBAMMultimodalFusion(
+            cnn_channels=cnn_out_channels,
+            tab_dim=tabular_embed_dim
         )
 
-        # Fused classification head
+        # Fused classification head (operates directly on token_dim)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(fused_dim),
+            nn.LayerNorm(token_dim),
             nn.Dropout(0.3),
-            nn.Linear(fused_dim, 128),
+            nn.Linear(token_dim, 128),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(128, num_classes)
@@ -396,10 +495,7 @@ class MultiModalHATR(nn.Module):
             image:   (B, 3, 224, 224)
             tabular: (B, 7) or None — if None, uses zero embedding
         """
-        # Image branch: get CLS token (classifier replaced with Identity)
-        cls_token = self.image_model(image)  # (B, 384)
-
-        # Tabular branch
+        # 1. Tabular branch
         if tabular is not None:
             tab_embed = self.tabular_encoder(tabular)  # (B, 64)
         else:
@@ -407,18 +503,28 @@ class MultiModalHATR(nn.Module):
                 image.size(0), 64, device=image.device
             )
 
-        # Fuse via gated concatenation
-        fused = torch.cat([cls_token, tab_embed], dim=1)  # (B, 448)
-        gate_weights = self.gate(fused)
-        fused = fused * gate_weights
+        # 2. Extract CNN feature maps from image
+        features = self.image_model.cnn_backbone(image)  # (B, C, H, W)
 
-        # Classify
-        logits = self.classifier(fused)  # (B, 2)
+        # 3. Apply CBAM-based Multimodal Fusion
+        fused_features = self.cbam_fusion(features, tab_embed)  # (B, C, H, W)
+
+        # 4. Convert to tokens via overlapping tokenizer
+        tokens = self.image_model.tokenizer(fused_features)  # (B, 49, 384)
+
+        # 5. Apply Hierarchical Token Refinement
+        tokens = self.image_model.hatr(tokens)  # (B, 49, 384)
+
+        # 6. Encoder (Transformer) -> get CLS token representation
+        cls_repr = self.image_model.transformer(tokens)  # (B, 384)
+
+        # 7. Classify
+        logits = self.classifier(cls_repr)  # (B, 2)
         return logits
 
 
 def build_model(model_type="hatr", num_classes=2, pretrained=True,
-                backbone_ckpt=None, multimodal=False):
+                backbone_ckpt=None, multimodal=False, backbone_type="resnet18"):
     """
     Factory function to build the specified model type.
 
@@ -428,6 +534,7 @@ def build_model(model_type="hatr", num_classes=2, pretrained=True,
         pretrained: Whether to use pretrained weights
         backbone_ckpt: Path to SimCLR pre-trained backbone (optional)
         multimodal: If True, builds MultiModalHATR instead of plain HATR
+        backbone_type: CNN backbone type ('resnet18' or 'resnet50')
 
     Returns:
         model: PyTorch model
@@ -435,9 +542,9 @@ def build_model(model_type="hatr", num_classes=2, pretrained=True,
     if multimodal and model_type == 'hatr':
         model = MultiModalHATR(
             num_classes=num_classes, pretrained=pretrained,
-            backbone_ckpt=backbone_ckpt
+            backbone_ckpt=backbone_ckpt, backbone_type=backbone_type
         )
-        label = 'MULTIMODAL-HATR'
+        label = f'MULTIMODAL-HATR ({backbone_type.upper()})'
     else:
         model_map = {
             "cnn": CNNOnlyModel,
@@ -448,14 +555,19 @@ def build_model(model_type="hatr", num_classes=2, pretrained=True,
         if model_type not in model_map:
             raise ValueError(f"Unknown model type '{model_type}'. Choose from: {list(model_map.keys())}")
 
-        if model_type == 'hatr' and backbone_ckpt:
+        if model_type == 'hatr':
             model = HATRHybridModel(
                 num_classes=num_classes, pretrained=pretrained,
-                backbone_ckpt=backbone_ckpt
+                backbone_ckpt=backbone_ckpt, backbone_type=backbone_type
+            )
+        elif model_type == 'cnn':
+            model = CNNOnlyModel(
+                num_classes=num_classes, pretrained=pretrained,
+                backbone_type=backbone_type
             )
         else:
             model = model_map[model_type](num_classes=num_classes, pretrained=pretrained)
-        label = model_type.upper()
+        label = f"{model_type.upper()} ({backbone_type.upper()})" if model_type in ['cnn', 'hatr'] else model_type.upper()
 
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
@@ -478,24 +590,37 @@ if __name__ == "__main__":
     dummy_input = torch.randn(2, 3, 224, 224).to(device)
     dummy_tabular = torch.randn(2, 7).to(device)
 
-    for model_type in ["cnn", "vit", "hatr"]:
-        print(f"\n{'─' * 40}")
-        model = build_model(model_type, num_classes=2, pretrained=False).to(device)
-        output = model(dummy_input)
-        print(f"  Input:  {dummy_input.shape}")
-        print(f"  Output: {output.shape}")
-        assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
-        print(f"  ✓ Forward pass successful")
+    for backbone in ["resnet18", "resnet50"]:
+        for model_type in ["cnn", "hatr"]:
+            print(f"\n{'-' * 40}")
+            model = build_model(model_type, num_classes=2, pretrained=False, backbone_type=backbone).to(device)
+            output = model(dummy_input)
+            print(f"  Backbone: {backbone}")
+            print(f"  Input:  {dummy_input.shape}")
+            print(f"  Output: {output.shape}")
+            assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
+            print(f"  * {model_type.upper()} with {backbone.upper()} forward pass successful")
+
+    # Validate ViT Model
+    print(f"\n{'-' * 40}")
+    vit_model = build_model("vit", num_classes=2, pretrained=False).to(device)
+    output = vit_model(dummy_input)
+    print(f"  Input:  {dummy_input.shape}")
+    print(f"  Output: {output.shape}")
+    assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
+    print(f"  * VIT forward pass successful")
 
     # Validate MultiModalHATR
-    print(f"\n{'─' * 40}")
-    mm_model = build_model('hatr', num_classes=2, pretrained=False, multimodal=True).to(device)
-    output = mm_model(dummy_input, dummy_tabular)
-    print(f"  Image input:   {dummy_input.shape}")
-    print(f"  Tabular input: {dummy_tabular.shape}")
-    print(f"  Output:        {output.shape}")
-    assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
-    print(f"  ✓ MultiModal forward pass successful")
+    for backbone in ["resnet18", "resnet50"]:
+        print(f"\n{'-' * 40}")
+        mm_model = build_model('hatr', num_classes=2, pretrained=False, multimodal=True, backbone_type=backbone).to(device)
+        output = mm_model(dummy_input, dummy_tabular)
+        print(f"  Backbone: {backbone}")
+        print(f"  Image input:   {dummy_input.shape}")
+        print(f"  Tabular input: {dummy_tabular.shape}")
+        print(f"  Output:        {output.shape}")
+        assert output.shape == (2, 2), f"Expected (2,2), got {output.shape}"
+        print(f"  * MultiModal forward pass successful")
 
     print(f"\n{'=' * 60}")
     print("All models validated successfully!")

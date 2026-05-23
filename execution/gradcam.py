@@ -11,7 +11,6 @@ Usage:
     python gradcam.py --num-samples 8     # Number of sample images
 """
 
-import os
 import sys
 import argparse
 from pathlib import Path
@@ -44,6 +43,10 @@ class GradCAM:
     Grad-CAM implementation for CNN and hybrid CNN-ViT models.
     Computes class activation maps by using gradients of the target class
     flowing into the final convolutional layer.
+
+    Supports context manager usage to automatically clean up hooks:
+        with GradCAM(model, target_layer) as gc:
+            heatmap, cls, conf = gc.generate(tensor)
     """
 
     def __init__(self, model, target_layer):
@@ -52,9 +55,9 @@ class GradCAM:
         self.gradients = None
         self.activations = None
 
-        # Register hooks
-        self.target_layer.register_forward_hook(self._forward_hook)
-        self.target_layer.register_full_backward_hook(self._backward_hook)
+        # Register hooks and STORE handles for cleanup
+        self._fwd_handle = self.target_layer.register_forward_hook(self._forward_hook)
+        self._bwd_handle = self.target_layer.register_full_backward_hook(self._backward_hook)
 
     def _forward_hook(self, module, input, output):
         self.activations = output.detach()
@@ -62,13 +65,26 @@ class GradCAM:
     def _backward_hook(self, module, grad_input, grad_output):
         self.gradients = grad_output[0].detach()
 
-    def generate(self, input_tensor, target_class=None):
+    def remove(self):
+        """Remove registered hooks to prevent memory leaks."""
+        self._fwd_handle.remove()
+        self._bwd_handle.remove()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.remove()
+        return False
+
+    def generate(self, input_tensor, target_class=None, tabular=None):
         """
         Generate Grad-CAM heatmap.
 
         Args:
             input_tensor: (1, 3, H, W) input image tensor
             target_class: Target class index (None = predicted class)
+            tabular: Optional clinical tabular features tensor
 
         Returns:
             heatmap: (H, W) normalized heatmap
@@ -78,7 +94,10 @@ class GradCAM:
         self.model.eval()
 
         # Forward pass
-        output = self.model(input_tensor)
+        if tabular is not None:
+            output = self.model(input_tensor, tabular)
+        else:
+            output = self.model(input_tensor)
         probs = F.softmax(output, dim=1)
 
         if target_class is None:
@@ -118,11 +137,17 @@ class GradCAM:
 def get_target_layer(model, model_type):
     """Get the target convolutional layer for Grad-CAM."""
     if model_type == 'cnn':
-        # Last conv layer of ResNet-18
-        return model.backbone.layer4[-1].conv2
+        # Last conv layer of ResNet backbone
+        last_block = model.backbone.layer4[-1]
+        if hasattr(last_block, 'conv3'):
+            return last_block.conv3
+        return last_block.conv2
     elif model_type == 'hatr':
         # Last conv layer of the CNN backbone
-        return model.cnn_backbone[-1][-1].conv2
+        last_block = model.cnn_backbone[-1][-1]
+        if hasattr(last_block, 'conv3'):
+            return last_block.conv3
+        return last_block.conv2
     elif model_type == 'vit':
         # For ViT, use the patch embedding layer (limited but functional)
         return model.vit.patch_embed.proj
@@ -151,10 +176,6 @@ def load_and_preprocess_image(img_path):
 def create_gradcam_visualization(model, model_type, device, num_samples=8):
     """Generate Grad-CAM visualizations for sample test images."""
 
-    # Get target layer
-    target_layer = get_target_layer(model, model_type)
-    grad_cam = GradCAM(model, target_layer)
-
     # Collect sample images from test set
     samples = []
     for class_name in CLASS_NAMES:
@@ -182,33 +203,57 @@ def create_gradcam_visualization(model, model_type, device, num_samples=8):
     fig.suptitle(f'Grad-CAM Visualization — {model_type.upper()} Model',
                  fontsize=18, fontweight='bold', y=1.02)
 
-    for idx, (img_path, true_label) in enumerate(samples):
-        row, col = idx // n_cols, idx % n_cols
+    # Check if model is multimodal
+    is_multimodal = hasattr(model, 'tabular_encoder')
+    ehr_records = {}
+    if is_multimodal:
+        import json
+        ehr_path = PROJECT_ROOT / ".tmp" / "data" / "ehr_records.json"
+        if ehr_path.exists():
+            with open(ehr_path, 'r') as f:
+                ehr_records = json.load(f)
 
-        # Load image
-        raw_img, tensor = load_and_preprocess_image(img_path)
-        tensor = tensor.to(device)
+    # Use context manager to auto-cleanup hooks after all images are processed
+    target_layer = get_target_layer(model, model_type)
+    with GradCAM(model, target_layer) as grad_cam:
+        for idx, (img_path, true_label) in enumerate(samples):
+            row, col = idx // n_cols, idx % n_cols
 
-        # Generate Grad-CAM
-        heatmap, pred_class, confidence = grad_cam.generate(tensor)
+            # Load image
+            raw_img, tensor = load_and_preprocess_image(img_path)
+            tensor = tensor.to(device)
 
-        # Overlay heatmap on original image
-        ax = axes[row, col]
+            # Generate Grad-CAM
+            tabular_tensor = None
+            if is_multimodal:
+                filename = Path(img_path).name
+                record = ehr_records.get(filename, {})
+                EHR_FIELDS = [
+                    'age', 'temperature', 'heart_rate', 'wbc_count',
+                    'respiratory_rate', 'cough_duration_days', 'oxygen_saturation'
+                ]
+                tab_vals = [float(record.get(field, 0.0)) for field in EHR_FIELDS]
+                tabular_tensor = torch.FloatTensor([tab_vals]).to(device)
 
-        ax.imshow(raw_img)
-        ax.imshow(heatmap, alpha=0.4, cmap='jet')
+            heatmap, pred_class, confidence = grad_cam.generate(tensor, tabular=tabular_tensor)
 
-        pred_label = CLASS_NAMES[pred_class]
-        correct = pred_label == true_label
-        color = '#2ecc71' if correct else '#e74c3c'
-        symbol = '✓' if correct else '✗'
+            # Overlay heatmap on original image
+            ax = axes[row, col]
 
-        ax.set_title(
-            f"True: {true_label}\n"
-            f"Pred: {pred_label} ({confidence:.1%}) {symbol}",
-            fontsize=10, color=color, fontweight='bold'
-        )
-        ax.axis('off')
+            ax.imshow(raw_img)
+            ax.imshow(heatmap, alpha=0.4, cmap='jet')
+
+            pred_label = CLASS_NAMES[pred_class]
+            correct = pred_label == true_label
+            color = '#2ecc71' if correct else '#e74c3c'
+            symbol = '✓' if correct else '✗'
+
+            ax.set_title(
+                f"True: {true_label}\n"
+                f"Pred: {pred_label} ({confidence:.1%}) {symbol}",
+                fontsize=10, color=color, fontweight='bold'
+            )
+            ax.axis('off')
 
     # Hide unused axes
     for idx in range(len(samples), n_rows * n_cols):
@@ -227,6 +272,9 @@ def main():
     parser.add_argument('--model', type=str, default='hatr',
                         choices=['cnn', 'vit', 'hatr', 'all'],
                         help='Model type (default: hatr)')
+    parser.add_argument('--backbone', type=str, default='resnet18',
+                        choices=['resnet18', 'resnet50'],
+                        help='CNN backbone type (default: resnet18)')
     parser.add_argument('--num-samples', type=int, default=8,
                         help='Number of sample images (default: 8)')
     args = parser.parse_args()
@@ -242,21 +290,31 @@ def main():
     models_to_viz = ['cnn', 'hatr'] if args.model == 'all' else [args.model]
 
     for model_type in models_to_viz:
-        checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+        # First try loading specific checkpoint
+        checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}_{args.backbone}.pth"
         if not checkpoint_path.exists():
-            print(f"\n  No checkpoint found for {model_type}")
+            # Fallback to default
+            checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+
+        if not checkpoint_path.exists():
+            print(f"\n  No checkpoint found for {model_type} at {checkpoint_path}")
             continue
 
         print(f"\n  Generating Grad-CAM for {model_type.upper()}...")
 
-        # Load model
-        model = build_model(model_type, num_classes=2, pretrained=False).to(device)
-        
-        # Dummy forward pass to initialize dynamic parameters (like pos_embed)
-        dummy_input = torch.randn(1, 3, 224, 224).to(device)
-        model(dummy_input)
-        
+        # Load checkpoint and determine the backbone_type from metadata
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        actual_backbone = checkpoint.get('backbone_type', args.backbone)
+
+        # Auto-detect if checkpoint is multimodal
+        state_keys = checkpoint.get("model_state_dict", {}).keys()
+        is_multimodal = any(k.startswith("tabular_encoder") for k in state_keys)
+
+        # Load model (pos_embed is now initialized in __init__, no dummy forward needed)
+        model = build_model(
+            model_type, num_classes=2, pretrained=False,
+            multimodal=is_multimodal, backbone_type=actual_backbone
+        ).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
 
         create_gradcam_visualization(model, model_type, device, args.num_samples)

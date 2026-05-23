@@ -12,12 +12,10 @@ Usage:
 """
 
 import os
-import sys
 import argparse
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -264,7 +262,7 @@ def pretrain_simclr(epochs=20, batch_size=64, lr=3e-4, temperature=0.5,
             print(f"  * Best backbone saved (loss: {best_loss:.4f})")
 
     total_time = time.time() - start_time
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print("  SimCLR pre-training complete!")
     print(f"  Best loss: {best_loss:.4f}")
     print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")

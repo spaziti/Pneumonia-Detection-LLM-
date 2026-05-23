@@ -1,0 +1,18 @@
+{
+  "python.analysis.extraPaths": [
+    "d:/coding/PROJ/newProject/execution",
+    "d:/coding/PROJ/newProject/dashboard/backend",
+    "./execution",
+    "./dashboard/backend",
+    "${workspaceFolder}/execution",
+    "${workspaceFolder}/dashboard/backend"
+  ],
+  "python.autoComplete.extraPaths": [
+    "d:/coding/PROJ/newProject/execution",
+    "d:/coding/PROJ/newProject/dashboard/backend",
+    "./execution",
+    "./dashboard/backend",
+    "${workspaceFolder}/execution",
+    "${workspaceFolder}/dashboard/backend"
+  ]
+}

@@ -9,3 +9,4 @@ torch
 torchvision
 timm
 google-generativeai
+pydicom

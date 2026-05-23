@@ -16,6 +16,9 @@ export default function ReportPanel({ report, speed = 8 }: ReportPanelProps) {
   useEffect(() => {
     if (!report) return;
 
+    setDisplayedLength(0);
+    setIsComplete(false);
+
     let idx = 0;
     const interval = setInterval(() => {
       idx += 1;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { motion } from "framer-motion";
 
 interface GradcamViewerProps {
@@ -26,6 +26,11 @@ export default function GradcamViewer({
   const [alpha, setAlpha] = useState(0.4);
   const [gradcamSrc, setGradcamSrc] = useState(initialGradcam);
   const [isUpdating, setIsUpdating] = useState(false);
+
+  useEffect(() => {
+    setGradcamSrc(initialGradcam);
+    setAlpha(0.4);
+  }, [initialGradcam]);
 
   const updateThreshold = useCallback(
     async (newAlpha: number) => {

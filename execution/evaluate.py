@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms.functional as TF
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
@@ -53,26 +54,77 @@ COLORS = {
 }
 
 
+def tta_predict(model, images, multimodal=False, tabular=None):
+    """
+    Run Test-Time Augmentation (TTA) on a batch of images.
+    Applies original, horizontal flip, and rotation (+/- 5 degrees) transformations,
+    then averages the predicted probabilities.
+    """
+    # 1. Original
+    if multimodal:
+        outputs = model(images, tabular)
+    else:
+        outputs = model(images)
+    probs = torch.softmax(outputs, dim=1)
+    
+    # 2. Horizontal flip
+    flipped_images = TF.hflip(images)
+    if multimodal:
+        flipped_outputs = model(flipped_images, tabular)
+    else:
+        flipped_outputs = model(flipped_images)
+    probs += torch.softmax(flipped_outputs, dim=1)
+    
+    # 3. Rotate +5 degrees
+    rot_pos_images = TF.rotate(images, angle=5)
+    if multimodal:
+        rot_pos_outputs = model(rot_pos_images, tabular)
+    else:
+        rot_pos_outputs = model(rot_pos_images)
+    probs += torch.softmax(rot_pos_outputs, dim=1)
+    
+    # 4. Rotate -5 degrees
+    rot_neg_images = TF.rotate(images, angle=-5)
+    if multimodal:
+        rot_neg_outputs = model(rot_neg_images, tabular)
+    else:
+        rot_neg_outputs = model(rot_neg_images)
+    probs += torch.softmax(rot_neg_outputs, dim=1)
+    
+    # Average the probabilities
+    probs /= 4.0
+    return probs
+
+
 @torch.no_grad()
-def get_predictions(model, loader, device, multimodal=False):
+def get_predictions(model, loader, device, multimodal=False, tta=False):
     """Get predictions and probabilities for the entire dataset."""
     model.eval()
     all_labels = []
     all_preds = []
     all_probs = []
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
+        if os.environ.get("DRY_RUN") == "1" and batch_idx >= 5:
+            break
         if multimodal:
             images, tabular, labels = batch
             images, tabular = images.to(device), tabular.to(device)
-            outputs = model(images, tabular)
+            if tta:
+                probs = tta_predict(model, images, multimodal=True, tabular=tabular)
+            else:
+                outputs = model(images, tabular)
+                probs = torch.softmax(outputs, dim=1)
         else:
             images, labels = batch
             images = images.to(device)
-            outputs = model(images)
+            if tta:
+                probs = tta_predict(model, images, multimodal=False)
+            else:
+                outputs = model(images)
+                probs = torch.softmax(outputs, dim=1)
 
-        probs = torch.softmax(outputs, dim=1)
-        _, predicted = outputs.max(1)
+        _, predicted = probs.max(1)
 
         all_labels.extend(labels.cpu().numpy())
         all_preds.extend(predicted.cpu().numpy())
@@ -238,28 +290,31 @@ def plot_model_comparison(all_metrics, save_dir):
     print(f"    Saved: {save_path.name}")
 
 
-def evaluate_model(model_type, device, multimodal=False):
+def evaluate_model(model_type, device, multimodal=False, backbone_type="resnet18", tta=False):
     """Full evaluation of a single model."""
-    checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+    # First try loading specific checkpoint
+    checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}_{backbone_type}.pth"
+    if not checkpoint_path.exists():
+        # Fallback to default
+        checkpoint_path = CHECKPOINT_DIR / f"best_{model_type}.pth"
+
     if not checkpoint_path.exists():
         print(f"\n  No checkpoint found for {model_type} at {checkpoint_path}")
         return None, None
 
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     print(f"  Evaluating: {model_type.upper()} Model")
-    print(f"{'─' * 50}")
+    print(f"{'-' * 50}")
 
+    # Load checkpoint first to detect backbone type
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    actual_backbone = checkpoint.get('backbone_type', backbone_type)
+    
     # Load model
     model = build_model(model_type, num_classes=2, pretrained=False,
-                         multimodal=multimodal).to(device)
-    
-    # Dummy forward pass to initialize dynamic parameters (like pos_embed)
-    dummy_input = torch.randn(1, 3, 224, 224).to(device)
-    model(dummy_input)
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                         multimodal=multimodal, backbone_type=actual_backbone).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"    Loaded checkpoint from epoch {checkpoint['epoch']}")
+    print(f"    Loaded checkpoint from epoch {checkpoint['epoch']} (Backbone: {actual_backbone})")
 
     # DataLoader
     num_workers = 0 if os.name == 'nt' else 2
@@ -268,7 +323,7 @@ def evaluate_model(model_type, device, multimodal=False):
 
     # Get predictions
     labels, preds, probs = get_predictions(model, test_loader, device,
-                                            multimodal=multimodal)
+                                            multimodal=multimodal, tta=tta)
 
     # Compute metrics
     metrics = compute_metrics(labels, preds, probs)
@@ -307,6 +362,11 @@ def main():
     parser.add_argument('--model', type=str, default='hatr',
                         choices=['cnn', 'vit', 'hatr', 'all'],
                         help='Model type to evaluate (default: hatr)')
+    parser.add_argument('--backbone', type=str, default='resnet18',
+                        choices=['resnet18', 'resnet50'],
+                        help='CNN backbone type (default: resnet18)')
+    parser.add_argument('--tta', action='store_true',
+                        help='Apply Test-Time Augmentation (TTA)')
     parser.add_argument('--multimodal', action='store_true',
                         help='Evaluate multi-modal model')
     args = parser.parse_args()
@@ -322,14 +382,17 @@ def main():
     all_results = {}
 
     for model_type in models_to_eval:
-        metrics, results = evaluate_model(model_type, device, multimodal=args.multimodal)
+        metrics, results = evaluate_model(
+            model_type, device, multimodal=args.multimodal,
+            backbone_type=args.backbone, tta=args.tta
+        )
         if metrics is not None:
             all_metrics[model_type] = metrics
             all_results[model_type] = results
 
     # Comparison plots (if multiple models)
     if len(all_metrics) > 1:
-        print(f"\n{'─' * 50}")
+        print(f"\n{'-' * 50}")
         print("  Generating comparison plots...")
         plot_roc_curve(None, None, None, RESULTS_DIR, all_results)
         plot_model_comparison(all_metrics, RESULTS_DIR)
@@ -338,7 +401,7 @@ def main():
         print(f"\n{'=' * 60}")
         print("  MODEL COMPARISON SUMMARY")
         print(f"  {'Model':<8} {'Acc':>8} {'Prec':>8} {'Recall':>8} {'F1':>8} {'AUC':>8}")
-        print(f"  {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+        print(f"  {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
         for name, m in all_metrics.items():
             print(f"  {name.upper():<8} {m['accuracy']:>7.2f}% {m['precision']:>7.2f}% "
                   f"{m['recall']:>7.2f}% {m['f1']:>7.2f}% {m['auc_roc']:>7.2f}%")

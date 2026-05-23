@@ -4,7 +4,6 @@ google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
 requests
-pandas
 torch
 torchvision
 timm
@@ -15,4 +14,4 @@ kaggle
 tqdm
 grad-cam
 Pillow
-pdfplumber
+google-generativeai
